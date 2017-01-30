@@ -19,6 +19,7 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -53,7 +54,10 @@ class PooledClusterConnectionProvider<K, V> implements ClusterConnectionProvider
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PooledClusterConnectionProvider.class);
 
     // Contains NodeId-identified and HostAndPort-identified connections.
+    private final Map<ConnectionKey, AtomicBoolean> connectionInProgress = new ConcurrentHashMap<>();
     private final Map<ConnectionKey, StatefulRedisConnection<K, V>> connections = new ConcurrentHashMap<>();
+    private final Map<ConnectionKey, RuntimeException> connectionExceptions = new ConcurrentHashMap<>();
+
     private final Object stateLock = new Object();
     private final boolean debugEnabled = logger.isDebugEnabled();
     private final StatefulRedisConnection<K, V> writers[] = new StatefulRedisConnection[SlotHash.SLOT_COUNT];
@@ -245,7 +249,8 @@ class PooledClusterConnectionProvider<K, V> implements ClusterConnectionProvider
 
     @Override
     public void close() {
-
+        this.connectionInProgress.clear();
+        this.connectionExceptions.clear();
         this.connections.clear();
         resetFastConnectionCache();
 
@@ -523,7 +528,40 @@ class PooledClusterConnectionProvider<K, V> implements ClusterConnectionProvider
     }
 
     private StatefulRedisConnection<K, V> getOrCreateConnection(ConnectionKey key) {
-        return connections.computeIfAbsent(key, connectionFactory);
+        StatefulRedisConnection<K, V> existingConnection = connections.get(key);
+        if (existingConnection != null) {
+            return existingConnection;
+        }
+        AtomicBoolean connectionIsInProgress = connectionInProgress.computeIfAbsent(key, connectionKey -> new AtomicBoolean());
+        boolean alreadyEstablishingByAnotherThread = connectionIsInProgress.getAndSet(true);
+        synchronized (connectionIsInProgress) {
+            existingConnection = connections.get(key);
+            if (existingConnection != null) {
+                return existingConnection;
+            }
+            RuntimeException runtimeException = connectionExceptions.get(key);
+            if (runtimeException != null) {
+                throw new RedisConnectionException("Parallel thread was unable to init connection", runtimeException);
+            }
+            if (!alreadyEstablishingByAnotherThread) {
+                try {
+                    return connections.computeIfAbsent(key, connectionFactory);
+                } catch (RuntimeException e) {
+                    connectionExceptions.put(key, e);
+                    throw e;
+                } finally {
+                    // we own this flag now (by synchronized + by getAndSet), safe to just set false
+                    connectionIsInProgress.set(false);
+                }
+            } else {
+                //another thread already tried to establish this connection when we were before synchronized block,
+                //we should get something from connections or connectionExceptions,
+                //because it's updates/reads are in critical section, so should never get here
+                assert false;
+                return null;
+            }
+
+        }
     }
 
     /**
